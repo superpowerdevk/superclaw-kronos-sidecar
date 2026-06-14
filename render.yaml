@@ -13,6 +13,8 @@ services:
       - key: HORIZON_LONG
         value: "24"
       - key: SAMPLE_COUNT
-        value: "20"
+        value: "10"
+      - key: LOOKBACK
+        value: "256"
       - key: REFRESH_TTL
         value: "600"
