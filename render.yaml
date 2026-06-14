@@ -8,9 +8,11 @@ services:
     envVars:
       - key: KRONOS_MODEL
         value: NeoQuasar/Kronos-small
-      - key: HORIZON_HRS
+      - key: HORIZON_SHORT
         value: "4"
+      - key: HORIZON_LONG
+        value: "24"
       - key: SAMPLE_COUNT
-        value: "30"
+        value: "20"
       - key: REFRESH_TTL
-        value: "300"
+        value: "600"
