@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: superclaw-kronos-sidecar
+    runtime: docker
+    plan: standard
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: KRONOS_MODEL
+        value: NeoQuasar/Kronos-small
+      - key: HORIZON_HRS
+        value: "4"
+      - key: SAMPLE_COUNT
+        value: "30"
+      - key: REFRESH_TTL
+        value: "300"
