@@ -75,15 +75,18 @@ def _downsample(lst, k):
     return [lst[round(i * step)] for i in range(k)]
 
 
-def _next_round(p: float) -> float:
-    """Next 'nice' level ~1% above spot, snapped to a clean 1/2/5/10 number — close
-    enough to be reachable in the horizon, far enough that odds aren't pinned."""
+def _round_level(p: float, direction: str) -> float:
+    """Next 'nice' ~1% level above (up) or below (down) spot, snapped to a clean
+    1/2/5/10 number — close enough to reach in the horizon, far enough that odds vary."""
     if p <= 0:
         return 0.0
     raw = p * 0.01
     mag = 10 ** math.floor(math.log10(raw))
     step = next((mag * m for m in (1, 2, 5, 10) if mag * m >= raw), mag * 10)
-    return (math.floor(p / step) + 1) * step
+    if direction == "up":
+        return (math.floor(p / step) + 1) * step
+    lvl = (math.ceil(p / step) - 1) * step
+    return lvl if lvl < p else lvl - step
 
 
 def _hl_candles(coin: str, dex: str | None):
@@ -140,7 +143,7 @@ def _forecast_all() -> list:
         last = [h["timestamps"].iloc[-1] for _, h, _ in loaded]
         yts = [pd.Series([t + timedelta(milliseconds=INTERVAL_MS * (k + 1)) for k in range(PRED_LEN)])
                for t in last]
-        agg = {lab: {"hs": 0, "hl": 0, "up": 0, "hi": [], "lo": [], "end": [], "paths": []}
+        agg = {lab: {"up": 0, "hi_s": [], "hi_l": [], "lo_s": [], "lo_l": [], "end": [], "paths": []}
                for lab, _, _ in loaded}
         runs = 0
         for _ in range(SAMPLE_COUNT):
@@ -153,31 +156,43 @@ def _forecast_all() -> list:
                 break
             runs += 1
             for (lab, _, spot), pdf in zip(loaded, preds):
-                tgt = _next_round(spot)
                 highs = pdf["high"].tolist(); lows = pdf["low"].tolist(); closes = pdf["close"].tolist()
                 a = agg[lab]
-                a["hs"] += 1 if max(highs[:SHORT_LEN]) >= tgt else 0
-                a["hl"] += 1 if max(highs) >= tgt else 0
                 a["up"] += 1 if closes[-1] > spot else 0
-                a["hi"].append(max(highs)); a["lo"].append(min(lows)); a["end"].append(closes[-1])
-                a["paths"].append(closes)
+                a["hi_s"].append(max(highs[:SHORT_LEN])); a["hi_l"].append(max(highs))
+                a["lo_s"].append(min(lows[:SHORT_LEN])); a["lo_l"].append(min(lows))
+                a["end"].append(closes[-1]); a["paths"].append(closes)
         for lab, _, spot in loaded:
             a = agg[lab]; n = runs
             if n == 0 or not a["paths"]:
                 out[lab] = None; continue
-            tgt = _next_round(spot)
+            prob_up = _clamp(100 * a["up"] / n)
+            # Direction follows the lean: bullish -> upside level + odds of breaking up;
+            # bearish -> downside level + odds of breaking down. One coherent signal.
+            direction = "up" if prob_up >= 50 else "down"
+            tgt = _round_level(spot, direction)
+            if direction == "up":
+                prob_short = _clamp(100 * sum(1 for h in a["hi_s"] if h >= tgt) / n)
+                prob_long = _clamp(100 * sum(1 for h in a["hi_l"] if h >= tgt) / n)
+            else:
+                prob_short = _clamp(100 * sum(1 for lo in a["lo_s"] if lo <= tgt) / n)
+                prob_long = _clamp(100 * sum(1 for lo in a["lo_l"] if lo <= tgt) / n)
+            exp_high = sum(a["hi_l"]) / n; exp_low = sum(a["lo_l"]) / n
+            # Stop = adverse side, take-profit = move side.
+            stop, tp = (exp_low, exp_high) if direction == "up" else (exp_high, exp_low)
             mean_path = [sum(p[i] for p in a["paths"]) / len(a["paths"]) for i in range(PRED_LEN)]
             out[lab] = {
                 "spot": round(spot, 4),
+                "direction": direction,
                 "target": round(tgt, 4),
-                "prob_short": _clamp(100 * a["hs"] / n),
-                "prob_long": _clamp(100 * a["hl"] / n),
-                "prob_up_pct": _clamp(100 * a["up"] / n),
-                "exp_high": round(sum(a["hi"]) / n, 4),
-                "exp_low": round(sum(a["lo"]) / n, 4),
+                "prob_short": prob_short,
+                "prob_long": prob_long,
+                "prob_up_pct": prob_up,
+                "exp_high": round(exp_high, 4),
+                "exp_low": round(exp_low, 4),
                 "exp_close": round(sum(a["end"]) / n, 4),
-                "suggested_stop": round(sum(a["lo"]) / n, 4),
-                "suggested_tp": round(sum(a["hi"]) / n, 4),
+                "suggested_stop": round(stop, 4),
+                "suggested_tp": round(tp, 4),
                 "horizon_short": HORIZON_SHORT,
                 "horizon_long": HORIZON_LONG,
                 "path": [round(x, 4) for x in _downsample(mean_path, 16)],
