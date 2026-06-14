@@ -98,14 +98,15 @@ def _hl_candles(coin: str, dex: str | None) -> pd.DataFrame | None:
 
 
 def _next_round(p: float) -> float:
-    if p >= 10000: step = 1000.0
-    elif p >= 1000: step = 100.0
-    elif p >= 100: step = 10.0
-    elif p >= 10: step = 1.0
-    elif p >= 1: step = 0.1
-    else: step = 0.01
-    nxt = math.floor(p / step) * step + step
-    return nxt if nxt > p else nxt + step
+    """Next 'nice' level ~0.5% above spot — close enough to be hittable in a short
+    horizon (so odds aren't pinned at 0 for low-vol assets), snapped to a clean
+    1/2/5 number so it still reads as a real level."""
+    if p <= 0:
+        return 0.0
+    raw = p * 0.005
+    mag = 10 ** math.floor(math.log10(raw))
+    step = next((mag * m for m in (1, 2, 5, 10) if mag * m >= raw), mag * 10)
+    return (math.floor(p / step) + 1) * step
 
 
 # ---- model --------------------------------------------------------------
