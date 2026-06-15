@@ -143,7 +143,7 @@ def _forecast_all() -> list:
         last = [h["timestamps"].iloc[-1] for _, h, _ in loaded]
         yts = [pd.Series([t + timedelta(milliseconds=INTERVAL_MS * (k + 1)) for k in range(PRED_LEN)])
                for t in last]
-        agg = {lab: {"up": 0, "hi_s": [], "hi_l": [], "lo_s": [], "lo_l": [], "end": [], "paths": []}
+        agg = {lab: {"ups": 0, "upl": 0, "hi": [], "lo": [], "end": [], "paths": []}
                for lab, _, _ in loaded}
         runs = 0
         for _ in range(SAMPLE_COUNT):
@@ -158,39 +158,29 @@ def _forecast_all() -> list:
             for (lab, _, spot), pdf in zip(loaded, preds):
                 highs = pdf["high"].tolist(); lows = pdf["low"].tolist(); closes = pdf["close"].tolist()
                 a = agg[lab]
-                a["up"] += 1 if closes[-1] > spot else 0
-                a["hi_s"].append(max(highs[:SHORT_LEN])); a["hi_l"].append(max(highs))
-                a["lo_s"].append(min(lows[:SHORT_LEN])); a["lo_l"].append(min(lows))
+                a["ups"] += 1 if closes[SHORT_LEN - 1] > spot else 0   # up at the short mark
+                a["upl"] += 1 if closes[-1] > spot else 0              # up at the long mark
+                a["hi"].append(max(highs)); a["lo"].append(min(lows))
                 a["end"].append(closes[-1]); a["paths"].append(closes)
         for lab, _, spot in loaded:
             a = agg[lab]; n = runs
             if n == 0 or not a["paths"]:
                 out[lab] = None; continue
-            prob_up = _clamp(100 * a["up"] / n)
-            # Direction follows the lean: bullish -> upside level + odds of breaking up;
-            # bearish -> downside level + odds of breaking down. One coherent signal.
-            direction = "up" if prob_up >= 50 else "down"
-            tgt = _round_level(spot, direction)
-            if direction == "up":
-                prob_short = _clamp(100 * sum(1 for h in a["hi_s"] if h >= tgt) / n)
-                prob_long = _clamp(100 * sum(1 for h in a["hi_l"] if h >= tgt) / n)
-            else:
-                prob_short = _clamp(100 * sum(1 for lo in a["lo_s"] if lo <= tgt) / n)
-                prob_long = _clamp(100 * sum(1 for lo in a["lo_l"] if lo <= tgt) / n)
-            exp_high = sum(a["hi_l"]) / n; exp_low = sum(a["lo_l"]) / n
-            # Stop = adverse side, take-profit = move side.
+            # Conviction = how often paths CLOSE up vs down (doesn't saturate like touch-odds).
+            prob_up_short = _clamp(100 * a["ups"] / n)
+            prob_up_long = _clamp(100 * a["upl"] / n)
+            direction = "up" if prob_up_long >= 50 else "down"
+            exp_high = sum(a["hi"]) / n; exp_low = sum(a["lo"]) / n; exp_close = sum(a["end"]) / n
             stop, tp = (exp_low, exp_high) if direction == "up" else (exp_high, exp_low)
             mean_path = [sum(p[i] for p in a["paths"]) / len(a["paths"]) for i in range(PRED_LEN)]
             out[lab] = {
                 "spot": round(spot, 4),
                 "direction": direction,
-                "target": round(tgt, 4),
-                "prob_short": prob_short,
-                "prob_long": prob_long,
-                "prob_up_pct": prob_up,
+                "prob_up_short": prob_up_short,
+                "prob_up_long": prob_up_long,
                 "exp_high": round(exp_high, 4),
                 "exp_low": round(exp_low, 4),
-                "exp_close": round(sum(a["end"]) / n, 4),
+                "exp_close": round(exp_close, 4),
                 "suggested_stop": round(stop, 4),
                 "suggested_tp": round(tp, 4),
                 "horizon_short": HORIZON_SHORT,
