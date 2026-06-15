@@ -16,8 +16,8 @@ Endpoints:
 
 from __future__ import annotations
 
-import math
 import os
+import statistics
 import sys
 import threading
 import time
@@ -74,19 +74,6 @@ def _downsample(lst, k):
     step = (len(lst) - 1) / (k - 1)
     return [lst[round(i * step)] for i in range(k)]
 
-
-def _round_level(p: float, direction: str) -> float:
-    """Next 'nice' ~1% level above (up) or below (down) spot, snapped to a clean
-    1/2/5/10 number — close enough to reach in the horizon, far enough that odds vary."""
-    if p <= 0:
-        return 0.0
-    raw = p * 0.01
-    mag = 10 ** math.floor(math.log10(raw))
-    step = next((mag * m for m in (1, 2, 5, 10) if mag * m >= raw), mag * 10)
-    if direction == "up":
-        return (math.floor(p / step) + 1) * step
-    lvl = (math.ceil(p / step) - 1) * step
-    return lvl if lvl < p else lvl - step
 
 
 def _hl_candles(coin: str, dex: str | None):
@@ -170,7 +157,8 @@ def _forecast_all() -> list:
             prob_up_short = _clamp(100 * a["ups"] / n)
             prob_up_long = _clamp(100 * a["upl"] / n)
             direction = "up" if prob_up_long >= 50 else "down"
-            exp_high = sum(a["hi"]) / n; exp_low = sum(a["lo"]) / n; exp_close = sum(a["end"]) / n
+            exp_high = sum(a["hi"]) / n; exp_low = sum(a["lo"]) / n
+            exp_close = statistics.median(a["end"])  # median agrees with direction even under skew
             stop, tp = (exp_low, exp_high) if direction == "up" else (exp_high, exp_low)
             mean_path = [sum(p[i] for p in a["paths"]) / len(a["paths"]) for i in range(PRED_LEN)]
             out[lab] = {
