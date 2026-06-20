@@ -68,22 +68,68 @@ import re  # noqa: E402
 import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 
-YF_SEARCH = "https://query1.finance.yahoo.com/v1/finance/search"
-YF_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-# Yahoo blocks cloud IPs without a browser UA.
-YF_HEADERS = {"User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                             "AppleWebKit/537.36 (KHTML, like Gecko) "
-                             "Chrome/124.0 Safari/537.36")}
-GEN_INTERVAL = os.environ.get("GEN_INTERVAL", "1d")      # daily candles = uniform across asset classes
-GEN_RANGE = os.environ.get("GEN_RANGE", "2y")            # ~512 daily candles of lookback
+HTTP_UA = {"User-Agent": "superclaw-price-forecast/1.0 (+https://superpower.io; admin@superpower.io)"}
+STOOQ = "https://stooq.com/q/d/l/"
+CG = "https://api.coingecko.com/api/v3"
+SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
+
+GEN_INTERVAL = os.environ.get("GEN_INTERVAL", "1d")
 GEN_HORIZON = int(os.environ.get("GEN_HORIZON", "5"))    # forecast N candles ahead (≈1 trading week)
 GEN_SAMPLES = int(os.environ.get("GEN_SAMPLES", "20"))   # forecast paths per symbol
 SYMBOL_TTL = int(os.environ.get("SYMBOL_TTL", "600"))    # per-symbol forecast cache (s)
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "512"))
 GEN_INTERVAL_S = {"1d": 86400, "1h": 3600, "1wk": 604800}.get(GEN_INTERVAL, 86400)
+
+# crypto name/ticker -> Hyperliquid coin (primary crypto source — proven from this box)
+CRYPTO_ALIASES = {
+    "btc": "BTC", "bitcoin": "BTC", "xbt": "BTC",
+    "eth": "ETH", "ethereum": "ETH", "ether": "ETH",
+    "sol": "SOL", "solana": "SOL", "bnb": "BNB", "binance coin": "BNB", "binancecoin": "BNB",
+    "xrp": "XRP", "ripple": "XRP", "doge": "DOGE", "dogecoin": "DOGE",
+    "ada": "ADA", "cardano": "ADA", "avax": "AVAX", "avalanche": "AVAX",
+    "link": "LINK", "chainlink": "LINK", "dot": "DOT", "polkadot": "DOT",
+    "matic": "MATIC", "polygon": "MATIC", "pol": "MATIC", "ltc": "LTC", "litecoin": "LTC",
+    "trx": "TRX", "tron": "TRX", "shib": "SHIB", "shiba": "SHIB", "shiba inu": "SHIB",
+    "uni": "UNI", "uniswap": "UNI", "atom": "ATOM", "cosmos": "ATOM", "near": "NEAR",
+    "apt": "APT", "aptos": "APT", "arb": "ARB", "arbitrum": "ARB", "op": "OP", "optimism": "OP",
+    "sui": "SUI", "sei": "SEI", "ton": "TON", "toncoin": "TON",
+    "hype": "HYPE", "hyperliquid": "HYPE", "pepe": "PEPE", "wif": "WIF", "dogwifhat": "WIF",
+    "bonk": "BONK", "jup": "JUP", "jupiter": "JUP", "ena": "ENA", "ethena": "ENA",
+    "tia": "TIA", "celestia": "TIA", "inj": "INJ", "injective": "INJ",
+    "fil": "FIL", "filecoin": "FIL", "fartcoin": "FARTCOIN", "ldo": "LDO", "lido": "LDO",
+}
+
+# tradfi natural language -> (stooq symbol, display name, type)
+TRADFI_ALIASES = {
+    "gold": ("xauusd", "Gold (XAU/USD)", "COMMODITY"), "xau": ("xauusd", "Gold (XAU/USD)", "COMMODITY"),
+    "silver": ("xagusd", "Silver (XAG/USD)", "COMMODITY"), "xag": ("xagusd", "Silver (XAG/USD)", "COMMODITY"),
+    "oil": ("cl.f", "WTI Crude Oil", "COMMODITY"), "crude": ("cl.f", "WTI Crude Oil", "COMMODITY"),
+    "wti": ("cl.f", "WTI Crude Oil", "COMMODITY"), "crude oil": ("cl.f", "WTI Crude Oil", "COMMODITY"),
+    "brent": ("cb.f", "Brent Crude Oil", "COMMODITY"),
+    "natural gas": ("ng.f", "Natural Gas", "COMMODITY"), "natgas": ("ng.f", "Natural Gas", "COMMODITY"),
+    "copper": ("hg.f", "Copper", "COMMODITY"), "platinum": ("pl.f", "Platinum", "COMMODITY"),
+    "palladium": ("pa.f", "Palladium", "COMMODITY"),
+    "sp500": ("^spx", "S&P 500", "INDEX"), "s&p 500": ("^spx", "S&P 500", "INDEX"),
+    "s&p500": ("^spx", "S&P 500", "INDEX"), "s&p": ("^spx", "S&P 500", "INDEX"),
+    "spx": ("^spx", "S&P 500", "INDEX"), "gspc": ("^spx", "S&P 500", "INDEX"),
+    "nasdaq": ("^ndq", "Nasdaq Composite", "INDEX"), "nasdaq composite": ("^ndq", "Nasdaq Composite", "INDEX"),
+    "ixic": ("^ndq", "Nasdaq Composite", "INDEX"),
+    "nasdaq 100": ("^ndx", "Nasdaq 100", "INDEX"), "ndx": ("^ndx", "Nasdaq 100", "INDEX"),
+    "dow": ("^dji", "Dow Jones", "INDEX"), "dow jones": ("^dji", "Dow Jones", "INDEX"),
+    "djia": ("^dji", "Dow Jones", "INDEX"), "dji": ("^dji", "Dow Jones", "INDEX"),
+    "russell": ("^rut", "Russell 2000", "INDEX"), "russell 2000": ("^rut", "Russell 2000", "INDEX"),
+    "vix": ("^vix", "Volatility Index (VIX)", "INDEX"),
+    "ftse": ("^ukx", "FTSE 100", "INDEX"), "ftse 100": ("^ukx", "FTSE 100", "INDEX"),
+    "dax": ("^dax", "DAX", "INDEX"), "nikkei": ("^nkx", "Nikkei 225", "INDEX"),
+    "^gspc": ("^spx", "S&P 500", "INDEX"), "^ixic": ("^ndq", "Nasdaq Composite", "INDEX"),
+    "^ndx": ("^ndx", "Nasdaq 100", "INDEX"), "^rut": ("^rut", "Russell 2000", "INDEX"),
+}
+_CCY = {"usd", "eur", "gbp", "jpy", "chf", "cad", "aud", "nzd", "cny", "hkd",
+        "sgd", "sek", "nok", "mxn", "zar", "try", "inr", "krw", "brl"}
 
 SYM_CACHE: dict = {}   # lowercased query -> resolved meta
 FC_CACHE: dict = {}    # symbol -> (epoch, payload)
-_YF = {"cookie": None, "crumb": None, "ts": 0.0}  # Yahoo session (datacenter unblock)
+SEC_MAP = {"by_ticker": None, "items": None, "ts": 0.0}  # cached SEC name->ticker index
 
 
 # ---- helpers ------------------------------------------------------------
@@ -208,141 +254,270 @@ def _forecast_all() -> list:
     return result
 
 
-def _yf_session(force: bool = False):
-    """Establish a Yahoo cookie + crumb. Servers/datacenter IPs need this or they get
-    throttled/401'd. Cached ~30min."""
-    now = time.time()
-    if not force and _YF["cookie"] and now - _YF["ts"] < 1800:
-        return _YF["cookie"], _YF["crumb"]
-    cookie, crumb = None, None
+def _http(url: str, headers: dict | None = None, timeout: int = 20) -> bytes:
+    req = urllib.request.Request(url, headers=headers or HTTP_UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _df_from_rows(rows):
+    """rows: list of (epoch_seconds, o, h, l, c, v). Returns a candle DataFrame or None."""
+    if not rows or len(rows) < 64:
+        return None
+    rows = rows[-LOOKBACK_DAYS:]
+    return pd.DataFrame({
+        "timestamps": pd.to_datetime([r[0] for r in rows], unit="s", utc=True),
+        "open": [r[1] for r in rows],
+        "high": [r[2] for r in rows],
+        "low": [r[3] for r in rows],
+        "close": [r[4] for r in rows],
+        "volume": [r[5] for r in rows],
+    })
+
+
+# ---- candle sources (all keyless, datacenter-friendly) ------------------
+def _stooq_candles(sym: str):
+    """Daily OHLCV CSV from Stooq. Covers US/global equities, ETFs, indices, FX, commodities."""
     try:
-        req = urllib.request.Request("https://fc.yahoo.com/", headers=YF_HEADERS)
-        try:
-            resp = urllib.request.urlopen(req, timeout=15)
-            raw = resp.headers.get_all("Set-Cookie")
-        except urllib.error.HTTPError as e:
-            raw = e.headers.get_all("Set-Cookie")
-        if raw:
-            cookie = "; ".join(c.split(";", 1)[0] for c in raw)
+        raw = _http(STOOQ + "?" + urllib.parse.urlencode({"s": sym, "i": "d"})).decode("utf-8", "replace")
+        lines = raw.strip().splitlines()
+        if len(lines) < 2 or not lines[0].lower().startswith("date"):
+            return None
+        rows = []
+        for ln in lines[1:]:
+            p = ln.split(",")
+            if len(p) < 5:
+                continue
+            try:
+                ep = int(pd.Timestamp(p[0], tz="UTC").timestamp())
+                o, h, l, c = float(p[1]), float(p[2]), float(p[3]), float(p[4])
+                v = float(p[5]) if len(p) > 5 and p[5] not in ("", "N/D") else 0.0
+            except Exception:
+                continue
+            rows.append((ep, o, h, l, c, v))
+        return _df_from_rows(rows)
     except Exception as e:
-        print(f"[yf-session] cookie failed: {e}", flush=True)
-    if cookie:
-        try:
-            creq = urllib.request.Request(
-                "https://query2.finance.yahoo.com/v1/test/getcrumb",
-                headers={**YF_HEADERS, "Cookie": cookie})
-            with urllib.request.urlopen(creq, timeout=15) as r:
-                crumb = (r.read().decode().strip() or None)
-        except Exception as e:
-            print(f"[yf-session] crumb failed: {e}", flush=True)
-    _YF.update(cookie=cookie, crumb=crumb, ts=now)
-    return cookie, crumb
+        print(f"[stooq] {sym} failed: {e}", flush=True)
+        return None
 
 
-def _yf_get(url: str, params: dict, use_crumb: bool = False):
-    cookie, crumb = _yf_session()
-    p = dict(params)
-    if use_crumb and crumb:
-        p["crumb"] = crumb
-    full = url + "?" + urllib.parse.urlencode(p)
-    headers = dict(YF_HEADERS)
-    if cookie:
-        headers["Cookie"] = cookie
-    req = urllib.request.Request(full, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode())
+def _hl_daily(coin: str):
+    """Daily OHLCV from Hyperliquid (keyless; already proven from this box)."""
+    end = int(time.time() * 1000)
+    start = end - (LOOKBACK_DAYS + 8) * 86400_000
+    req = {"type": "candleSnapshot",
+           "req": {"coin": coin, "interval": "1d", "startTime": start, "endTime": end}}
+    try:
+        r = urllib.request.Request(HL, data=json.dumps(req).encode(),
+                                   headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=20) as resp:
+            arr = json.loads(resp.read().decode())
+        if not isinstance(arr, list) or len(arr) < 64:
+            return None
+        rows = [(int(c["t"]) // 1000, float(c["o"]), float(c["h"]),
+                 float(c["l"]), float(c["c"]), float(c["v"])) for c in arr]
+        return _df_from_rows(rows)
+    except Exception as e:
+        print(f"[hl-daily] {coin} failed: {e}", flush=True)
+        return None
 
 
-def _looks_like_symbol(q: str) -> bool:
-    """True for concrete tickers (AAPL, ^GSPC, EURUSD=X, BTC-USD, GC=F) so we can hit the
-    chart endpoint directly and skip the flaky search endpoint."""
-    if " " in q or not q:
-        return False
-    if any(c in q for c in "^=.-"):
-        return True
-    return q.isupper() and 1 <= len(q) <= 6
+def _cg_search(q: str):
+    """CoinGecko coin search -> {id, symbol, name} of the top market-cap match, or None."""
+    try:
+        data = json.loads(_http(CG + "/search?" + urllib.parse.urlencode({"query": q})).decode())
+        coins = data.get("coins") or []
+        if not coins:
+            return None
+        coins.sort(key=lambda c: (c.get("market_cap_rank") is None, c.get("market_cap_rank") or 1e9))
+        c = coins[0]
+        return {"id": c["id"], "symbol": (c.get("symbol") or "").upper(), "name": c.get("name") or c["id"]}
+    except Exception as e:
+        print(f"[cg-search] {q!r} failed: {e}", flush=True)
+        return None
+
+
+def _cg_ohlc(coin_id: str):
+    """CoinGecko OHLC fallback for coins not on Hyperliquid (coarse candles; no volume)."""
+    try:
+        url = CG + f"/coins/{urllib.parse.quote(coin_id)}/ohlc?" + urllib.parse.urlencode(
+            {"vs_currency": "usd", "days": "365"})
+        arr = json.loads(_http(url).decode())
+        if not isinstance(arr, list) or len(arr) < 64:
+            return None
+        rows = [(int(x[0]) // 1000, float(x[1]), float(x[2]), float(x[3]), float(x[4]), 0.0) for x in arr]
+        return _df_from_rows(rows)
+    except Exception as e:
+        print(f"[cg-ohlc] {coin_id} failed: {e}", flush=True)
+        return None
+
+
+# ---- name -> ticker (SEC, free US equities directory) -------------------
+def _sec_index():
+    now = time.time()
+    if SEC_MAP["items"] is not None and now - SEC_MAP["ts"] < 86400:
+        return SEC_MAP["items"]
+    try:
+        data = json.loads(_http(SEC_TICKERS).decode())
+        items, tickers = [], set()
+        for v in data.values():
+            t = (v.get("ticker") or "").upper()
+            title = v.get("title") or ""
+            if t and title:
+                items.append((t, title, title.lower()))
+                tickers.add(t)
+        SEC_MAP.update(items=items, by_ticker=tickers, ts=now)
+    except Exception as e:
+        print(f"[sec] index load failed: {e}", flush=True)
+        SEC_MAP.update(items=[], by_ticker=set(), ts=now)
+    return SEC_MAP["items"]
+
+
+def _sec_tickers() -> set:
+    _sec_index()
+    return SEC_MAP["by_ticker"] or set()
+
+
+_CORP_SUFFIX = (" inc", " inc.", " incorporated", " corp", " corp.", " corporation",
+                " company", " co", " co.", " ltd", " ltd.", " plc", " holdings",
+                " group", " the", ",")
+
+
+def _norm_name(s: str) -> str:
+    s = s.lower().strip()
+    for suf in _CORP_SUFFIX:
+        s = s.replace(suf, " ")
+    return " ".join(s.split())
+
+
+def _sec_ticker(name: str):
+    """Best-effort company-name -> US ticker via the SEC directory."""
+    items = _sec_index()
+    if not items:
+        return None
+    qn = _norm_name(name)
+    if not qn:
+        return None
+    exact, starts, contains = None, None, None
+    for t, title, tl in items:
+        n = _norm_name(title)
+        if n == qn:
+            exact = (t, title)
+            break
+        if starts is None and n.startswith(qn):
+            starts = (t, title)
+        if contains is None and qn in n:
+            contains = (t, title)
+    pick = exact or starts or contains
+    return pick  # (ticker, title) or None
+
+
+# ---- resolver -----------------------------------------------------------
+_CRYPTO_PAT = re.compile(r"^([a-z0-9]{2,10})[-/]?(usd|usdt|usdc)$")
+_FX_PAT = re.compile(r"^([a-z]{3})([a-z]{3})(=x)?$")
+_TICKER_PAT = re.compile(r"^[a-z]{1,5}$")
 
 
 def resolve_symbol(q: str):
-    """Natural-language or ticker -> best symbol meta. Symbol-like inputs skip search and
-    are validated later by the candle fetch; only free text hits Yahoo search."""
+    """q (name or ticker) -> meta {symbol,name,type,source,key}. source in {hl,stooq,cg}."""
     q = (q or "").strip()
     if not q:
         return None
-    key = q.lower()
-    if key in SYM_CACHE:
-        return SYM_CACHE[key]
+    low = q.lower()
+    if low in SYM_CACHE:
+        return SYM_CACHE[low]
+
     meta = None
-    if _looks_like_symbol(q):
-        meta = {"symbol": q.upper(), "name": q.upper(), "type": "", "exchange": ""}
+    # 1) crypto by alias
+    if low in CRYPTO_ALIASES:
+        coin = CRYPTO_ALIASES[low]
+        meta = {"symbol": coin, "name": coin, "type": "CRYPTOCURRENCY", "source": "hl", "key": coin}
+    # 2) tradfi by alias (indices, commodities, metals)
+    elif low in TRADFI_ALIASES:
+        sym, nm, ty = TRADFI_ALIASES[low]
+        meta = {"symbol": sym.upper(), "name": nm, "type": ty, "source": "stooq", "key": sym}
     else:
-        try:
-            data = _yf_get(YF_SEARCH, {"q": q, "quotesCount": 6, "newsCount": 0}, use_crumb=True)
-            quotes = [x for x in data.get("quotes", []) if x.get("symbol")]
-            if quotes:
-                exact = next((x for x in quotes if x["symbol"].lower() == key), None)
-                pick = exact or quotes[0]
-                meta = {
-                    "symbol": pick["symbol"],
-                    "name": pick.get("shortname") or pick.get("longname") or pick["symbol"],
-                    "type": pick.get("quoteType", ""),
-                    "exchange": pick.get("exchDisp") or pick.get("exchange", ""),
-                }
-        except Exception as e:
-            print(f"[resolve] {q!r} search failed: {e}", flush=True)
+        cm = _CRYPTO_PAT.match(low)
+        fm = _FX_PAT.match(low)
+        # 3) crypto pair pattern (btc-usd, ethusdt, solusd)
+        if cm and cm.group(1).upper() in set(CRYPTO_ALIASES.values()):
+            coin = cm.group(1).upper()
+            meta = {"symbol": coin, "name": coin, "type": "CRYPTOCURRENCY", "source": "hl", "key": coin}
+        elif cm and cm.group(1) in CRYPTO_ALIASES:
+            coin = CRYPTO_ALIASES[cm.group(1)]
+            meta = {"symbol": coin, "name": coin, "type": "CRYPTOCURRENCY", "source": "hl", "key": coin}
+        # 4) FX pair (eurusd, usdjpy, eurusd=x)
+        elif fm and fm.group(1) in _CCY and fm.group(2) in _CCY:
+            pair = fm.group(1) + fm.group(2)
+            meta = {"symbol": pair.upper(), "name": f"{fm.group(1).upper()}/{fm.group(2).upper()}",
+                    "type": "CURRENCY", "source": "stooq", "key": pair}
+        # 5) explicit index (^spx) or futures (cl.f) typed straight through
+        elif q.startswith("^") or low.endswith(".f"):
+            meta = {"symbol": q.upper(), "name": q.upper(),
+                    "type": "INDEX" if q.startswith("^") else "COMMODITY",
+                    "source": "stooq", "key": low}
+        # 6) short token: real ticker (known to SEC or typed uppercase) vs a company name
+        elif _TICKER_PAT.match(low):
+            if low.upper() in _sec_tickers() or q.isupper():
+                meta = {"symbol": low.upper(), "name": low.upper(), "type": "EQUITY",
+                        "source": "stooq", "key": f"{low}.us"}
+            else:
+                hit = _sec_ticker(q)
+                if hit:
+                    meta = {"symbol": hit[0], "name": hit[1], "type": "EQUITY",
+                            "source": "stooq", "key": f"{hit[0].lower()}.us"}
+                else:
+                    cg = _cg_search(q)
+                    if cg:
+                        on_hl = cg["symbol"] in set(CRYPTO_ALIASES.values())
+                        meta = {"symbol": cg["symbol"] or cg["id"].upper(), "name": cg["name"],
+                                "type": "CRYPTOCURRENCY", "source": "hl" if on_hl else "cg",
+                                "key": cg["symbol"] if on_hl else cg["id"]}
+        else:
+            # 7) free-text name -> SEC (US equity), else CoinGecko (maybe a coin/project)
+            hit = _sec_ticker(q)
+            if hit:
+                meta = {"symbol": hit[0], "name": hit[1], "type": "EQUITY",
+                        "source": "stooq", "key": f"{hit[0].lower()}.us"}
+            else:
+                cg = _cg_search(q)
+                if cg:
+                    coin = cg["symbol"]
+                    on_hl = coin in set(CRYPTO_ALIASES.values()) or coin in CRYPTO_ALIASES.values()
+                    meta = {"symbol": coin or cg["id"].upper(), "name": cg["name"],
+                            "type": "CRYPTOCURRENCY", "source": "hl" if on_hl else "cg",
+                            "key": coin if on_hl else cg["id"]}
     if meta:
-        SYM_CACHE[key] = meta
+        SYM_CACHE[low] = meta
     return meta
 
 
-def _yf_candles(symbol: str):
-    """Daily OHLCV + chart meta from Yahoo's chart endpoint. Returns (df, meta) or (None, {})."""
-    try:
-        data = _yf_get(YF_CHART.format(symbol=urllib.parse.quote(symbol, safe="=.-^")),
-                       {"range": GEN_RANGE, "interval": GEN_INTERVAL})
-        res = data["chart"]["result"][0]
-        cm = res.get("meta", {}) or {}
-        ts = res["timestamp"]
-        qd = res["indicators"]["quote"][0]
-        rows = []
-        for i, t in enumerate(ts):
-            o, h, l, c = qd["open"][i], qd["high"][i], qd["low"][i], qd["close"][i]
-            v = (qd.get("volume") or [None] * len(ts))[i]
-            if None in (o, h, l, c):
-                continue
-            rows.append((t, o, h, l, c, float(v or 0.0)))
-        if len(rows) < 64:
-            return None, cm
-        rows = rows[-LOOKBACK:]
-        df = pd.DataFrame({
-            "timestamps": pd.to_datetime([r[0] for r in rows], unit="s", utc=True),
-            "open": [r[1] for r in rows],
-            "high": [r[2] for r in rows],
-            "low": [r[3] for r in rows],
-            "close": [r[4] for r in rows],
-            "volume": [r[5] for r in rows],
-        })
-        return df, cm
-    except Exception as e:
-        print(f"[candles-yf] {symbol} failed: {e}", flush=True)
-        return None, {}
+def _candles(meta: dict):
+    """Dispatch to the right source. Crypto tries Hyperliquid then CoinGecko OHLC."""
+    src = meta.get("source")
+    key = meta.get("key")
+    if src == "stooq":
+        return _stooq_candles(key)
+    if src == "hl":
+        df = _hl_daily(key)
+        if df is not None:
+            return df
+        cg = _cg_search(meta.get("name") or key)  # HL miss -> CoinGecko OHLC fallback
+        if cg:
+            meta["source"] = "cg"
+            return _cg_ohlc(cg["id"])
+        return None
+    if src == "cg":
+        return _cg_ohlc(key)
+    return None
 
 
 def _forecast_symbol(meta: dict):
     """Run Kronos GEN_SAMPLES times over daily candles for one resolved symbol."""
     sym = meta["symbol"]
-    df, cm = _yf_candles(sym)
+    df = _candles(meta)
     if df is None or len(df) < 64:
         return None
-    # enrich display fields from chart meta when search was skipped/blocked
-    if not meta.get("type") and cm.get("instrumentType"):
-        meta["type"] = cm["instrumentType"]
-    if (not meta.get("name") or meta["name"] == sym) and (cm.get("shortName") or cm.get("longName")):
-        meta["name"] = cm.get("shortName") or cm.get("longName")
-    if not meta.get("exchange") and cm.get("exchangeName"):
-        meta["exchange"] = cm["exchangeName"]
-    if cm.get("symbol"):
-        sym = meta["symbol"] = cm["symbol"]
     hist = df.iloc[-min(len(df), MAX_CONTEXT):].reset_index(drop=True)
     spot = float(hist["close"].iloc[-1])
     x = hist[["open", "high", "low", "close", "volume"]]
@@ -397,8 +572,9 @@ def _forecast_symbol(meta: dict):
     return {
         "symbol": sym,
         "name": meta["name"],
-        "type": meta["type"],
-        "exchange": meta["exchange"],
+        "type": meta.get("type", ""),
+        "exchange": meta.get("exchange", ""),
+        "source": meta.get("source", ""),
         "spot": round(spot, 4),
         "direction": "up" if prob_up >= 50 else "down",
         "prob_up": prob_up,
@@ -452,47 +628,41 @@ def forecast():
                               "model": MODEL_NAME}
 
 
-@app.get("/yf_debug")
-def yf_debug(q: str = "AAPL"):
-    """Diagnostic: what does Yahoo actually return from this server's IP?"""
+@app.get("/src_debug")
+def src_debug(q: str = "AAPL"):
+    """Diagnostic: resolver decision + per-source reachability from this server's IP."""
     out: dict = {"query": q}
-    cookie, crumb = _yf_session(force=True)
-    out["cookie_len"] = len(cookie) if cookie else 0
-    out["crumb"] = crumb
-    h = dict(YF_HEADERS)
-    if cookie:
-        h["Cookie"] = cookie
-    # raw search
     try:
-        full = YF_SEARCH + "?" + urllib.parse.urlencode(
-            {"q": q, "quotesCount": 3, "newsCount": 0, **({"crumb": crumb} if crumb else {})})
-        with urllib.request.urlopen(urllib.request.Request(full, headers=h), timeout=15) as r:
-            out["search_status"] = getattr(r, "status", 200)
-            out["search_body"] = r.read(500).decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        out["search_status"] = e.code
-        out["search_body"] = e.read(300).decode("utf-8", "replace")
+        meta = resolve_symbol(q)
+        out["resolved"] = meta
     except Exception as e:
-        out["search_err"] = str(e)
-    # raw chart
+        out["resolve_err"] = str(e)
+        meta = None
+
+    def probe(name, fn):
+        try:
+            df = fn()
+            out[name] = {"ok": df is not None, "rows": (0 if df is None else len(df))}
+        except Exception as e:
+            out[name] = {"err": str(e)[:200]}
+
+    probe("stooq_aapl_us", lambda: _stooq_candles("aapl.us"))
+    probe("hl_BTC", lambda: _hl_daily("BTC"))
+    probe("cg_search_bitcoin", lambda: ({"x": _cg_search("bitcoin")}.get("x")
+                                        and pd.DataFrame({"a": [1] * 64})))
     try:
-        cu = (YF_CHART.format(symbol=urllib.parse.quote(q, safe="=.-^")) + "?"
-              + urllib.parse.urlencode({"range": "5d", "interval": "1d"}))
-        with urllib.request.urlopen(urllib.request.Request(cu, headers=h), timeout=15) as r:
-            out["chart_status"] = getattr(r, "status", 200)
-            out["chart_ok"] = True
-    except urllib.error.HTTPError as e:
-        out["chart_status"] = e.code
-        out["chart_body"] = e.read(300).decode("utf-8", "replace")
+        out["sec_items"] = len(_sec_index() or [])
     except Exception as e:
-        out["chart_err"] = str(e)
+        out["sec_err"] = str(e)[:200]
+    if meta:
+        probe("resolved_candles", lambda: _candles(dict(meta)))
     return out
 
 
 @app.get("/forecast/symbol")
 def forecast_symbol(q: str):
     """On-demand forecast for ANY asset (stocks, ETFs, indices, FX, commodities, crypto).
-    Resolves q -> Yahoo symbol -> daily candles -> Kronos. Per-symbol TTL cache."""
+    Resolves q -> symbol -> daily candles (Stooq / Hyperliquid / CoinGecko) -> Kronos."""
     if _PREDICTOR is None:
         return {"ok": False, "status": "warming", "query": q}
     meta = resolve_symbol(q)
