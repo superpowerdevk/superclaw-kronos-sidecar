@@ -74,7 +74,7 @@ BROWSER_UA = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb
 STOOQ = "https://stooq.com/q/d/l/"
 CG = "https://api.coingecko.com/api/v3"
 SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
-FMP = "https://financialmodelingprep.com/api/v3/historical-price-full/"
+FMP = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 
 GEN_INTERVAL = os.environ.get("GEN_INTERVAL", "1d")
 GEN_HORIZON = int(os.environ.get("GEN_HORIZON", "5"))    # forecast N candles ahead (≈1 trading week)
@@ -323,27 +323,28 @@ def _fmp_symbol(meta: dict) -> str:
 
 
 def _fmp_candles(meta: dict):
-    """Daily OHLCV from Financial Modeling Prep (API, not a scrape -> no datacenter IP block).
+    """Daily OHLCV from Financial Modeling Prep stable EOD API (not a scrape -> no IP block).
     Active only when FMP_API_KEY is set."""
     key = os.environ.get("FMP_API_KEY", "").strip()
     if not key:
         return None
     sym = _fmp_symbol(meta)
     try:
-        url = FMP + urllib.parse.quote(sym) + "?" + urllib.parse.urlencode(
-            {"apikey": key, "timeseries": str(LOOKBACK_DAYS)})
+        frm = (datetime.now(timezone.utc) - timedelta(days=int(LOOKBACK_DAYS * 1.6))).strftime("%Y-%m-%d")
+        url = FMP + "?" + urllib.parse.urlencode({"symbol": sym, "from": frm, "apikey": key})
         data = json.loads(_http(url).decode())
-        hist = (data.get("historical") if isinstance(data, dict) else None) or []
-        if len(hist) < 64:
+        hist = data.get("historical") if isinstance(data, dict) else data  # stable=list, legacy=dict
+        if not isinstance(hist, list) or len(hist) < 64:
             return None
         rows = []
-        for r in reversed(hist):  # FMP is newest-first
+        for r in hist:
             try:
                 ep = int(pd.Timestamp(r["date"], tz="UTC").timestamp())
                 rows.append((ep, float(r["open"]), float(r["high"]),
                              float(r["low"]), float(r["close"]), float(r.get("volume") or 0)))
             except Exception:
                 continue
+        rows.sort()  # FMP returns newest-first; sort to oldest-first
         return _df_from_rows(rows)
     except Exception as e:
         print(f"[fmp] {sym} failed: {e}", flush=True)
@@ -717,6 +718,12 @@ def src_debug(q: str = "AAPL"):
     out["fmp_key_set"] = bool(os.environ.get("FMP_API_KEY", "").strip())
     if out["fmp_key_set"]:
         probe("fmp_aapl", lambda: _fmp_candles({"type": "EQUITY", "symbol": "AAPL", "key": "aapl.us"}))
+        try:
+            k = os.environ["FMP_API_KEY"].strip()
+            u = FMP + "?" + urllib.parse.urlencode({"symbol": "AAPL", "apikey": k})
+            out["fmp_raw"] = _http(u)[:220].decode("utf-8", "replace")
+        except Exception as e:
+            out["fmp_raw_err"] = str(e)[:160]
     if meta:
         probe("resolved_candles", lambda: _candles(dict(meta)))
     return out
