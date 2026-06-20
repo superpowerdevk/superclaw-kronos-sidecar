@@ -69,9 +69,12 @@ import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 
 HTTP_UA = {"User-Agent": "superclaw-price-forecast/1.0 (+https://superpower.io; admin@superpower.io)"}
+BROWSER_UA = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")}
 STOOQ = "https://stooq.com/q/d/l/"
 CG = "https://api.coingecko.com/api/v3"
 SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
+FMP = "https://financialmodelingprep.com/api/v3/historical-price-full/"
 
 GEN_INTERVAL = os.environ.get("GEN_INTERVAL", "1d")
 GEN_HORIZON = int(os.environ.get("GEN_HORIZON", "5"))    # forecast N candles ahead (≈1 trading week)
@@ -277,11 +280,14 @@ def _df_from_rows(rows):
 
 # ---- candle sources (all keyless, datacenter-friendly) ------------------
 def _stooq_candles(sym: str):
-    """Daily OHLCV CSV from Stooq. Covers US/global equities, ETFs, indices, FX, commodities."""
+    """Daily OHLCV CSV from Stooq. Covers US/global equities, ETFs, indices, FX, commodities.
+    Keyless but rate-limited on shared datacenter IPs."""
     try:
-        raw = _http(STOOQ + "?" + urllib.parse.urlencode({"s": sym, "i": "d"})).decode("utf-8", "replace")
+        raw = _http(STOOQ + "?" + urllib.parse.urlencode({"s": sym, "i": "d"}),
+                    headers=BROWSER_UA).decode("utf-8", "replace")
         lines = raw.strip().splitlines()
         if len(lines) < 2 or not lines[0].lower().startswith("date"):
+            print(f"[stooq] {sym} non-CSV body: {raw[:120]!r}", flush=True)
             return None
         rows = []
         for ln in lines[1:]:
@@ -298,6 +304,49 @@ def _stooq_candles(sym: str):
         return _df_from_rows(rows)
     except Exception as e:
         print(f"[stooq] {sym} failed: {e}", flush=True)
+        return None
+
+
+_FMP_INDEX = {"^SPX": "^GSPC", "^NDQ": "^IXIC", "^DJI": "^DJI", "^RUT": "^RUT",
+              "^NDX": "^NDX", "^VIX": "^VIX", "^UKX": "^FTSE", "^DAX": "^GDAXI", "^NKX": "^N225"}
+_FMP_CMDTY = {"XAUUSD": "GCUSD", "XAGUSD": "SIUSD", "CL.F": "CLUSD", "CB.F": "BZUSD",
+              "NG.F": "NGUSD", "HG.F": "HGUSD", "PL.F": "PLUSD", "PA.F": "PAUSD"}
+
+
+def _fmp_symbol(meta: dict) -> str:
+    t, s = meta.get("type", ""), meta["symbol"]
+    if t == "INDEX":
+        return _FMP_INDEX.get(s, s)
+    if t == "COMMODITY":
+        return _FMP_CMDTY.get(s, s)
+    return s  # equity/ETF ticker, or 6-letter FX pair (EURUSD)
+
+
+def _fmp_candles(meta: dict):
+    """Daily OHLCV from Financial Modeling Prep (API, not a scrape -> no datacenter IP block).
+    Active only when FMP_API_KEY is set."""
+    key = os.environ.get("FMP_API_KEY", "").strip()
+    if not key:
+        return None
+    sym = _fmp_symbol(meta)
+    try:
+        url = FMP + urllib.parse.quote(sym) + "?" + urllib.parse.urlencode(
+            {"apikey": key, "timeseries": str(LOOKBACK_DAYS)})
+        data = json.loads(_http(url).decode())
+        hist = (data.get("historical") if isinstance(data, dict) else None) or []
+        if len(hist) < 64:
+            return None
+        rows = []
+        for r in reversed(hist):  # FMP is newest-first
+            try:
+                ep = int(pd.Timestamp(r["date"], tz="UTC").timestamp())
+                rows.append((ep, float(r["open"]), float(r["high"]),
+                             float(r["low"]), float(r["close"]), float(r.get("volume") or 0)))
+            except Exception:
+                continue
+        return _df_from_rows(rows)
+    except Exception as e:
+        print(f"[fmp] {sym} failed: {e}", flush=True)
         return None
 
 
@@ -497,7 +546,11 @@ def _candles(meta: dict):
     src = meta.get("source")
     key = meta.get("key")
     if src == "stooq":
-        return _stooq_candles(key)
+        df = _fmp_candles(meta)        # API source (no IP block) when FMP_API_KEY set
+        if df is not None:
+            meta["source"] = "fmp"
+            return df
+        return _stooq_candles(key)     # keyless fallback (works on clean IPs / self-host)
     if src == "hl":
         df = _hl_daily(key)
         if df is not None:
@@ -654,6 +707,16 @@ def src_debug(q: str = "AAPL"):
         out["sec_items"] = len(_sec_index() or [])
     except Exception as e:
         out["sec_err"] = str(e)[:200]
+    # raw stooq body (why is it failing from this IP?)
+    try:
+        rawb = _http(STOOQ + "?" + urllib.parse.urlencode({"s": "aapl.us", "i": "d"}),
+                     headers=BROWSER_UA)
+        out["stooq_raw"] = rawb[:160].decode("utf-8", "replace")
+    except Exception as e:
+        out["stooq_raw_err"] = str(e)[:160]
+    out["fmp_key_set"] = bool(os.environ.get("FMP_API_KEY", "").strip())
+    if out["fmp_key_set"]:
+        probe("fmp_aapl", lambda: _fmp_candles({"type": "EQUITY", "symbol": "AAPL", "key": "aapl.us"}))
     if meta:
         probe("resolved_candles", lambda: _candles(dict(meta)))
     return out
