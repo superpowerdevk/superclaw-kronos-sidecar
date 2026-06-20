@@ -585,26 +585,34 @@ def _forecast_symbol(meta: dict):
     paths: list = []
     runs = 0
     t0 = time.time()
-    with _MODEL_LOCK:  # hold once for the whole forecast so the refresher can't interleave/starve it
-        for _ in range(GEN_SAMPLES):
-            try:
-                preds = _PREDICTOR.predict_batch(
-                    df_list=[x], x_timestamp_list=[xts], y_timestamp_list=[yts],
-                    pred_len=GEN_HORIZON, T=1.0, top_p=0.9, sample_count=1, verbose=False)
-            except Exception as e:
-                print(f"[predict-sym] {sym} failed after {runs} runs: {e}", flush=True)
-                break
-            runs += 1
-            pdf = preds[0]
+    # One batched call: GEN_SAMPLES identical inputs -> GEN_SAMPLES independent stochastic
+    # paths, but amortizes all per-call overhead (much faster than a Python loop on CPU).
+    with _MODEL_LOCK:
+        try:
+            preds = _PREDICTOR.predict_batch(
+                df_list=[x] * GEN_SAMPLES,
+                x_timestamp_list=[xts] * GEN_SAMPLES,
+                y_timestamp_list=[yts] * GEN_SAMPLES,
+                pred_len=GEN_HORIZON, T=1.0, top_p=0.9, sample_count=1, verbose=False)
+        except Exception as e:
+            print(f"[predict-sym] {sym} batched call failed: {e}", flush=True)
+            preds = []
+    for pdf in preds:
+        try:
             closes = pdf["close"].tolist()
             highs = pdf["high"].tolist()
             lows = pdf["low"].tolist()
-            ups += 1 if closes[-1] > spot else 0
-            hi.append(max(highs))
-            lo.append(min(lows))
-            end.append(closes[-1])
-            paths.append(closes)
-    print(f"[forecast-sym] {sym}: {runs} Kronos runs in {time.time()-t0:.1f}s", flush=True)
+        except Exception:
+            continue
+        runs += 1
+        ups += 1 if closes[-1] > spot else 0
+        hi.append(max(highs))
+        lo.append(min(lows))
+        end.append(closes[-1])
+        paths.append(closes)
+    spread = (max(end) - min(end)) if end else 0.0
+    print(f"[forecast-sym] {sym}: {runs} paths in {time.time()-t0:.1f}s, "
+          f"end-spread={spread:.4f}", flush=True)
 
     if runs == 0 or not paths:
         print(f"[forecast-sym] {sym}: candles ok but Kronos produced no paths", flush=True)
