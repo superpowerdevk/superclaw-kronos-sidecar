@@ -649,6 +649,39 @@ def _candles(meta: dict):
     return None
 
 
+def _pctile(sorted_vals, p):
+    """Linear-interpolated percentile of an already-sorted list."""
+    if not sorted_vals:
+        return 0.0
+    k = (len(sorted_vals) - 1) * p
+    f = int(k)
+    c = min(f + 1, len(sorted_vals) - 1)
+    return sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f)
+
+
+def _bands_from_paths(paths, horizon):
+    """Per-step p10/p25/p50/p75/p90 across the sample paths -> the forecast cone."""
+    out = {"p10": [], "p25": [], "p50": [], "p75": [], "p90": []}
+    for i in range(horizon):
+        col = sorted(p[i] for p in paths if i < len(p))
+        for key, q in (("p10", .10), ("p25", .25), ("p50", .50), ("p75", .75), ("p90", .90)):
+            out[key].append(round(_pctile(col, q), 4))
+    return out
+
+
+_CCY_BY_EXCH = {"SH": "¥", "SZ": "¥", "HK": "HK$"}
+
+
+def _ccy_symbol(meta):
+    """Display currency symbol by listing venue: ¥ for A-shares, HK$ for HK, $ otherwise."""
+    ex = (meta.get("exchange") or "").upper()
+    if ex in _CCY_BY_EXCH:
+        return _CCY_BY_EXCH[ex]
+    if (meta.get("type") or "").upper() == "CURRENCY":
+        return ""  # FX quote is a rate, not a price in some currency
+    return "$"
+
+
 def _forecast_symbol(meta: dict):
     """Run Kronos GEN_SAMPLES times over daily candles for one resolved symbol."""
     sym = meta["symbol"]
@@ -738,6 +771,15 @@ def _forecast_symbol(meta: dict):
         "interval": GEN_INTERVAL,
         "samples": runs,
         "path": [round(v, 4) for v in _downsample(mean_path, 16)],
+        # ---- chart data (for the in-app visual forecaster) ----
+        "ccy": _ccy_symbol(meta),
+        "hist_t": [int(t.timestamp()) for t in hist["timestamps"].tail(90)],
+        "hist_o": [round(float(v), 4) for v in hist["open"].tail(90)],
+        "hist_h": [round(float(v), 4) for v in hist["high"].tail(90)],
+        "hist_l": [round(float(v), 4) for v in hist["low"].tail(90)],
+        "hist_c": [round(float(v), 4) for v in hist["close"].tail(90)],
+        "fc_t": [int(t.timestamp()) for t in yts],
+        "bands": _bands_from_paths(paths, GEN_HORIZON),
     }
 
 
