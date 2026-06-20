@@ -543,13 +543,12 @@ def resolve_symbol(q: str):
 
 
 def _candles(meta: dict):
-    """Dispatch to the right source. Crypto tries Hyperliquid then CoinGecko OHLC."""
+    """Dispatch to the right source. Never mutates meta (it may be the cached object)."""
     src = meta.get("source")
     key = meta.get("key")
-    if src == "stooq":
+    if src in ("stooq", "fmp"):
         df = _fmp_candles(meta)        # API source (no IP block) when FMP_API_KEY set
         if df is not None:
-            meta["source"] = "fmp"
             return df
         return _stooq_candles(key)     # keyless fallback (works on clean IPs / self-host)
     if src == "hl":
@@ -558,7 +557,6 @@ def _candles(meta: dict):
             return df
         cg = _cg_search(meta.get("name") or key)  # HL miss -> CoinGecko OHLC fallback
         if cg:
-            meta["source"] = "cg"
             return _cg_ohlc(cg["id"])
         return None
     if src == "cg":
@@ -571,6 +569,7 @@ def _forecast_symbol(meta: dict):
     sym = meta["symbol"]
     df = _candles(meta)
     if df is None or len(df) < 64:
+        print(f"[forecast-sym] {sym}: no candles (source={meta.get('source')}, key={meta.get('key')})", flush=True)
         return None
     hist = df.iloc[-min(len(df), MAX_CONTEXT):].reset_index(drop=True)
     spot = float(hist["close"].iloc[-1])
@@ -606,6 +605,7 @@ def _forecast_symbol(meta: dict):
         paths.append(closes)
 
     if runs == 0 or not paths:
+        print(f"[forecast-sym] {sym}: candles ok but Kronos produced no paths", flush=True)
         return None
 
     prob_up = _clamp(100 * ups / runs)
