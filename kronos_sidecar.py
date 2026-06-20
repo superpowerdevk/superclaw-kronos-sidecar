@@ -64,6 +64,8 @@ _MODEL_LOCK = threading.Lock()  # serialize Kronos access (batch refresher + on-
 
 # ---- generic on-demand (price-forecast skill) ---------------------------
 import math  # noqa: E402
+import re  # noqa: E402
+import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 
 YF_SEARCH = "https://query1.finance.yahoo.com/v1/finance/search"
@@ -81,6 +83,7 @@ GEN_INTERVAL_S = {"1d": 86400, "1h": 3600, "1wk": 604800}.get(GEN_INTERVAL, 8640
 
 SYM_CACHE: dict = {}   # lowercased query -> resolved meta
 FC_CACHE: dict = {}    # symbol -> (epoch, payload)
+_YF = {"cookie": None, "crumb": None, "ts": 0.0}  # Yahoo session (datacenter unblock)
 
 
 # ---- helpers ------------------------------------------------------------
@@ -205,61 +208,113 @@ def _forecast_all() -> list:
     return result
 
 
-def _yf_get(url: str, params: dict):
-    full = url + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(full, headers=YF_HEADERS)
+def _yf_session(force: bool = False):
+    """Establish a Yahoo cookie + crumb. Servers/datacenter IPs need this or they get
+    throttled/401'd. Cached ~30min."""
+    now = time.time()
+    if not force and _YF["cookie"] and now - _YF["ts"] < 1800:
+        return _YF["cookie"], _YF["crumb"]
+    cookie, crumb = None, None
+    try:
+        req = urllib.request.Request("https://fc.yahoo.com/", headers=YF_HEADERS)
+        try:
+            resp = urllib.request.urlopen(req, timeout=15)
+            raw = resp.headers.get_all("Set-Cookie")
+        except urllib.error.HTTPError as e:
+            raw = e.headers.get_all("Set-Cookie")
+        if raw:
+            cookie = "; ".join(c.split(";", 1)[0] for c in raw)
+    except Exception as e:
+        print(f"[yf-session] cookie failed: {e}", flush=True)
+    if cookie:
+        try:
+            creq = urllib.request.Request(
+                "https://query2.finance.yahoo.com/v1/test/getcrumb",
+                headers={**YF_HEADERS, "Cookie": cookie})
+            with urllib.request.urlopen(creq, timeout=15) as r:
+                crumb = (r.read().decode().strip() or None)
+        except Exception as e:
+            print(f"[yf-session] crumb failed: {e}", flush=True)
+    _YF.update(cookie=cookie, crumb=crumb, ts=now)
+    return cookie, crumb
+
+
+def _yf_get(url: str, params: dict, use_crumb: bool = False):
+    cookie, crumb = _yf_session()
+    p = dict(params)
+    if use_crumb and crumb:
+        p["crumb"] = crumb
+    full = url + "?" + urllib.parse.urlencode(p)
+    headers = dict(YF_HEADERS)
+    if cookie:
+        headers["Cookie"] = cookie
+    req = urllib.request.Request(full, headers=headers)
     with urllib.request.urlopen(req, timeout=20) as resp:
         return json.loads(resp.read().decode())
 
 
+def _looks_like_symbol(q: str) -> bool:
+    """True for concrete tickers (AAPL, ^GSPC, EURUSD=X, BTC-USD, GC=F) so we can hit the
+    chart endpoint directly and skip the flaky search endpoint."""
+    if " " in q or not q:
+        return False
+    if any(c in q for c in "^=.-"):
+        return True
+    return q.isupper() and 1 <= len(q) <= 6
+
+
 def resolve_symbol(q: str):
-    """Natural-language or ticker -> best Yahoo symbol. Covers stocks, ETFs, indices,
-    FX, commodities, and crypto through one endpoint. Cached per query."""
+    """Natural-language or ticker -> best symbol meta. Symbol-like inputs skip search and
+    are validated later by the candle fetch; only free text hits Yahoo search."""
     q = (q or "").strip()
     if not q:
         return None
     key = q.lower()
     if key in SYM_CACHE:
         return SYM_CACHE[key]
-    try:
-        data = _yf_get(YF_SEARCH, {"q": q, "quotesCount": 6, "newsCount": 0})
-        quotes = [x for x in data.get("quotes", []) if x.get("symbol")]
-        if not quotes:
-            return None
-        exact = next((x for x in quotes if x["symbol"].lower() == key), None)
-        pick = exact or quotes[0]
-        meta = {
-            "symbol": pick["symbol"],
-            "name": pick.get("shortname") or pick.get("longname") or pick["symbol"],
-            "type": pick.get("quoteType", "EQUITY"),
-            "exchange": pick.get("exchDisp") or pick.get("exchange", ""),
-        }
+    meta = None
+    if _looks_like_symbol(q):
+        meta = {"symbol": q.upper(), "name": q.upper(), "type": "", "exchange": ""}
+    else:
+        try:
+            data = _yf_get(YF_SEARCH, {"q": q, "quotesCount": 6, "newsCount": 0}, use_crumb=True)
+            quotes = [x for x in data.get("quotes", []) if x.get("symbol")]
+            if quotes:
+                exact = next((x for x in quotes if x["symbol"].lower() == key), None)
+                pick = exact or quotes[0]
+                meta = {
+                    "symbol": pick["symbol"],
+                    "name": pick.get("shortname") or pick.get("longname") or pick["symbol"],
+                    "type": pick.get("quoteType", ""),
+                    "exchange": pick.get("exchDisp") or pick.get("exchange", ""),
+                }
+        except Exception as e:
+            print(f"[resolve] {q!r} search failed: {e}", flush=True)
+    if meta:
         SYM_CACHE[key] = meta
-        return meta
-    except Exception as e:
-        print(f"[resolve] {q!r} failed: {e}", flush=True)
-        return None
+    return meta
 
 
 def _yf_candles(symbol: str):
-    """Daily OHLCV from Yahoo's keyless chart endpoint. None if too thin."""
+    """Daily OHLCV + chart meta from Yahoo's chart endpoint. Returns (df, meta) or (None, {})."""
     try:
-        data = _yf_get(YF_CHART.format(symbol=urllib.parse.quote(symbol, safe="")),
+        data = _yf_get(YF_CHART.format(symbol=urllib.parse.quote(symbol, safe="=.-^")),
                        {"range": GEN_RANGE, "interval": GEN_INTERVAL})
         res = data["chart"]["result"][0]
+        cm = res.get("meta", {}) or {}
         ts = res["timestamp"]
-        q = res["indicators"]["quote"][0]
+        qd = res["indicators"]["quote"][0]
         rows = []
         for i, t in enumerate(ts):
-            o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
-            v = (q.get("volume") or [None] * len(ts))[i]
+            o, h, l, c = qd["open"][i], qd["high"][i], qd["low"][i], qd["close"][i]
+            v = (qd.get("volume") or [None] * len(ts))[i]
             if None in (o, h, l, c):
                 continue
             rows.append((t, o, h, l, c, float(v or 0.0)))
         if len(rows) < 64:
-            return None
+            return None, cm
         rows = rows[-LOOKBACK:]
-        return pd.DataFrame({
+        df = pd.DataFrame({
             "timestamps": pd.to_datetime([r[0] for r in rows], unit="s", utc=True),
             "open": [r[1] for r in rows],
             "high": [r[2] for r in rows],
@@ -267,17 +322,27 @@ def _yf_candles(symbol: str):
             "close": [r[4] for r in rows],
             "volume": [r[5] for r in rows],
         })
+        return df, cm
     except Exception as e:
         print(f"[candles-yf] {symbol} failed: {e}", flush=True)
-        return None
+        return None, {}
 
 
 def _forecast_symbol(meta: dict):
     """Run Kronos GEN_SAMPLES times over daily candles for one resolved symbol."""
     sym = meta["symbol"]
-    df = _yf_candles(sym)
+    df, cm = _yf_candles(sym)
     if df is None or len(df) < 64:
         return None
+    # enrich display fields from chart meta when search was skipped/blocked
+    if not meta.get("type") and cm.get("instrumentType"):
+        meta["type"] = cm["instrumentType"]
+    if (not meta.get("name") or meta["name"] == sym) and (cm.get("shortName") or cm.get("longName")):
+        meta["name"] = cm.get("shortName") or cm.get("longName")
+    if not meta.get("exchange") and cm.get("exchangeName"):
+        meta["exchange"] = cm["exchangeName"]
+    if cm.get("symbol"):
+        sym = meta["symbol"] = cm["symbol"]
     hist = df.iloc[-min(len(df), MAX_CONTEXT):].reset_index(drop=True)
     spot = float(hist["close"].iloc[-1])
     x = hist[["open", "high", "low", "close", "volume"]]
@@ -385,6 +450,43 @@ def forecast():
         return dict(CACHE) | {"interval": INTERVAL, "horizon_short": HORIZON_SHORT,
                               "horizon_long": HORIZON_LONG, "sample_count": SAMPLE_COUNT,
                               "model": MODEL_NAME}
+
+
+@app.get("/yf_debug")
+def yf_debug(q: str = "AAPL"):
+    """Diagnostic: what does Yahoo actually return from this server's IP?"""
+    out: dict = {"query": q}
+    cookie, crumb = _yf_session(force=True)
+    out["cookie_len"] = len(cookie) if cookie else 0
+    out["crumb"] = crumb
+    h = dict(YF_HEADERS)
+    if cookie:
+        h["Cookie"] = cookie
+    # raw search
+    try:
+        full = YF_SEARCH + "?" + urllib.parse.urlencode(
+            {"q": q, "quotesCount": 3, "newsCount": 0, **({"crumb": crumb} if crumb else {})})
+        with urllib.request.urlopen(urllib.request.Request(full, headers=h), timeout=15) as r:
+            out["search_status"] = getattr(r, "status", 200)
+            out["search_body"] = r.read(500).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        out["search_status"] = e.code
+        out["search_body"] = e.read(300).decode("utf-8", "replace")
+    except Exception as e:
+        out["search_err"] = str(e)
+    # raw chart
+    try:
+        cu = (YF_CHART.format(symbol=urllib.parse.quote(q, safe="=.-^")) + "?"
+              + urllib.parse.urlencode({"range": "5d", "interval": "1d"}))
+        with urllib.request.urlopen(urllib.request.Request(cu, headers=h), timeout=15) as r:
+            out["chart_status"] = getattr(r, "status", 200)
+            out["chart_ok"] = True
+    except urllib.error.HTTPError as e:
+        out["chart_status"] = e.code
+        out["chart_body"] = e.read(300).decode("utf-8", "replace")
+    except Exception as e:
+        out["chart_err"] = str(e)
+    return out
 
 
 @app.get("/forecast/symbol")
