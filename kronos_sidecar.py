@@ -78,7 +78,7 @@ FMP = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 
 GEN_INTERVAL = os.environ.get("GEN_INTERVAL", "1d")
 GEN_HORIZON = int(os.environ.get("GEN_HORIZON", "5"))    # forecast N candles ahead (≈1 trading week)
-GEN_SAMPLES = int(os.environ.get("GEN_SAMPLES", "20"))   # forecast paths per symbol
+GEN_SAMPLES = int(os.environ.get("GEN_SAMPLES", "10"))   # forecast paths per symbol (latency vs stability)
 SYMBOL_TTL = int(os.environ.get("SYMBOL_TTL", "600"))    # per-symbol forecast cache (s)
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "512"))
 GEN_INTERVAL_S = {"1d": 86400, "1h": 3600, "1wk": 604800}.get(GEN_INTERVAL, 86400)
@@ -584,25 +584,27 @@ def _forecast_symbol(meta: dict):
     end: list = []
     paths: list = []
     runs = 0
-    for _ in range(GEN_SAMPLES):
-        try:
-            with _MODEL_LOCK:
+    t0 = time.time()
+    with _MODEL_LOCK:  # hold once for the whole forecast so the refresher can't interleave/starve it
+        for _ in range(GEN_SAMPLES):
+            try:
                 preds = _PREDICTOR.predict_batch(
                     df_list=[x], x_timestamp_list=[xts], y_timestamp_list=[yts],
                     pred_len=GEN_HORIZON, T=1.0, top_p=0.9, sample_count=1, verbose=False)
-        except Exception as e:
-            print(f"[predict-sym] {sym} failed: {e}", flush=True)
-            break
-        runs += 1
-        pdf = preds[0]
-        closes = pdf["close"].tolist()
-        highs = pdf["high"].tolist()
-        lows = pdf["low"].tolist()
-        ups += 1 if closes[-1] > spot else 0
-        hi.append(max(highs))
-        lo.append(min(lows))
-        end.append(closes[-1])
-        paths.append(closes)
+            except Exception as e:
+                print(f"[predict-sym] {sym} failed after {runs} runs: {e}", flush=True)
+                break
+            runs += 1
+            pdf = preds[0]
+            closes = pdf["close"].tolist()
+            highs = pdf["high"].tolist()
+            lows = pdf["low"].tolist()
+            ups += 1 if closes[-1] > spot else 0
+            hi.append(max(highs))
+            lo.append(min(lows))
+            end.append(closes[-1])
+            paths.append(closes)
+    print(f"[forecast-sym] {sym}: {runs} Kronos runs in {time.time()-t0:.1f}s", flush=True)
 
     if runs == 0 or not paths:
         print(f"[forecast-sym] {sym}: candles ok but Kronos produced no paths", flush=True)
