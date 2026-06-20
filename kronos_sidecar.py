@@ -60,6 +60,27 @@ app = FastAPI()
 CACHE: dict = {"status": "warming", "assets": [], "updated_at": None}
 _PREDICTOR = None
 _LOCK = threading.Lock()
+_MODEL_LOCK = threading.Lock()  # serialize Kronos access (batch refresher + on-demand symbol calls)
+
+# ---- generic on-demand (price-forecast skill) ---------------------------
+import math  # noqa: E402
+import urllib.parse  # noqa: E402
+
+YF_SEARCH = "https://query1.finance.yahoo.com/v1/finance/search"
+YF_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+# Yahoo blocks cloud IPs without a browser UA.
+YF_HEADERS = {"User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) "
+                             "Chrome/124.0 Safari/537.36")}
+GEN_INTERVAL = os.environ.get("GEN_INTERVAL", "1d")      # daily candles = uniform across asset classes
+GEN_RANGE = os.environ.get("GEN_RANGE", "2y")            # ~512 daily candles of lookback
+GEN_HORIZON = int(os.environ.get("GEN_HORIZON", "5"))    # forecast N candles ahead (≈1 trading week)
+GEN_SAMPLES = int(os.environ.get("GEN_SAMPLES", "20"))   # forecast paths per symbol
+SYMBOL_TTL = int(os.environ.get("SYMBOL_TTL", "600"))    # per-symbol forecast cache (s)
+GEN_INTERVAL_S = {"1d": 86400, "1h": 3600, "1wk": 604800}.get(GEN_INTERVAL, 86400)
+
+SYM_CACHE: dict = {}   # lowercased query -> resolved meta
+FC_CACHE: dict = {}    # symbol -> (epoch, payload)
 
 
 # ---- helpers ------------------------------------------------------------
@@ -135,9 +156,10 @@ def _forecast_all() -> list:
         runs = 0
         for _ in range(SAMPLE_COUNT):
             try:
-                preds = _PREDICTOR.predict_batch(
-                    df_list=x_list, x_timestamp_list=xts, y_timestamp_list=yts,
-                    pred_len=PRED_LEN, T=1.0, top_p=0.9, sample_count=1, verbose=False)
+                with _MODEL_LOCK:
+                    preds = _PREDICTOR.predict_batch(
+                        df_list=x_list, x_timestamp_list=xts, y_timestamp_list=yts,
+                        pred_len=PRED_LEN, T=1.0, top_p=0.9, sample_count=1, verbose=False)
             except Exception as e:
                 print(f"[predict] batch failed: {e}", flush=True)
                 break
@@ -183,6 +205,152 @@ def _forecast_all() -> list:
     return result
 
 
+def _yf_get(url: str, params: dict):
+    full = url + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(full, headers=YF_HEADERS)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode())
+
+
+def resolve_symbol(q: str):
+    """Natural-language or ticker -> best Yahoo symbol. Covers stocks, ETFs, indices,
+    FX, commodities, and crypto through one endpoint. Cached per query."""
+    q = (q or "").strip()
+    if not q:
+        return None
+    key = q.lower()
+    if key in SYM_CACHE:
+        return SYM_CACHE[key]
+    try:
+        data = _yf_get(YF_SEARCH, {"q": q, "quotesCount": 6, "newsCount": 0})
+        quotes = [x for x in data.get("quotes", []) if x.get("symbol")]
+        if not quotes:
+            return None
+        exact = next((x for x in quotes if x["symbol"].lower() == key), None)
+        pick = exact or quotes[0]
+        meta = {
+            "symbol": pick["symbol"],
+            "name": pick.get("shortname") or pick.get("longname") or pick["symbol"],
+            "type": pick.get("quoteType", "EQUITY"),
+            "exchange": pick.get("exchDisp") or pick.get("exchange", ""),
+        }
+        SYM_CACHE[key] = meta
+        return meta
+    except Exception as e:
+        print(f"[resolve] {q!r} failed: {e}", flush=True)
+        return None
+
+
+def _yf_candles(symbol: str):
+    """Daily OHLCV from Yahoo's keyless chart endpoint. None if too thin."""
+    try:
+        data = _yf_get(YF_CHART.format(symbol=urllib.parse.quote(symbol, safe="")),
+                       {"range": GEN_RANGE, "interval": GEN_INTERVAL})
+        res = data["chart"]["result"][0]
+        ts = res["timestamp"]
+        q = res["indicators"]["quote"][0]
+        rows = []
+        for i, t in enumerate(ts):
+            o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+            v = (q.get("volume") or [None] * len(ts))[i]
+            if None in (o, h, l, c):
+                continue
+            rows.append((t, o, h, l, c, float(v or 0.0)))
+        if len(rows) < 64:
+            return None
+        rows = rows[-LOOKBACK:]
+        return pd.DataFrame({
+            "timestamps": pd.to_datetime([r[0] for r in rows], unit="s", utc=True),
+            "open": [r[1] for r in rows],
+            "high": [r[2] for r in rows],
+            "low": [r[3] for r in rows],
+            "close": [r[4] for r in rows],
+            "volume": [r[5] for r in rows],
+        })
+    except Exception as e:
+        print(f"[candles-yf] {symbol} failed: {e}", flush=True)
+        return None
+
+
+def _forecast_symbol(meta: dict):
+    """Run Kronos GEN_SAMPLES times over daily candles for one resolved symbol."""
+    sym = meta["symbol"]
+    df = _yf_candles(sym)
+    if df is None or len(df) < 64:
+        return None
+    hist = df.iloc[-min(len(df), MAX_CONTEXT):].reset_index(drop=True)
+    spot = float(hist["close"].iloc[-1])
+    x = hist[["open", "high", "low", "close", "volume"]]
+    xts = hist["timestamps"]
+    last = hist["timestamps"].iloc[-1]
+    yts = pd.Series([last + timedelta(seconds=GEN_INTERVAL_S * (k + 1)) for k in range(GEN_HORIZON)])
+
+    ups = 0
+    hi: list = []
+    lo: list = []
+    end: list = []
+    paths: list = []
+    runs = 0
+    for _ in range(GEN_SAMPLES):
+        try:
+            with _MODEL_LOCK:
+                preds = _PREDICTOR.predict_batch(
+                    df_list=[x], x_timestamp_list=[xts], y_timestamp_list=[yts],
+                    pred_len=GEN_HORIZON, T=1.0, top_p=0.9, sample_count=1, verbose=False)
+        except Exception as e:
+            print(f"[predict-sym] {sym} failed: {e}", flush=True)
+            break
+        runs += 1
+        pdf = preds[0]
+        closes = pdf["close"].tolist()
+        highs = pdf["high"].tolist()
+        lows = pdf["low"].tolist()
+        ups += 1 if closes[-1] > spot else 0
+        hi.append(max(highs))
+        lo.append(min(lows))
+        end.append(closes[-1])
+        paths.append(closes)
+
+    if runs == 0 or not paths:
+        return None
+
+    prob_up = _clamp(100 * ups / runs)
+    exp_close = statistics.median(end)
+    exp_high = sum(hi) / runs
+    exp_low = sum(lo) / runs
+    mean_path = [sum(p[i] for p in paths) / len(paths) for i in range(GEN_HORIZON)]
+
+    # "Meaningful move" target = ~1σ over the horizon, from realized daily vol.
+    rets = hist["close"].pct_change().dropna()
+    daily_vol = float(rets.std()) if len(rets) > 5 else 0.02
+    move_pct = max(0.01, daily_vol * math.sqrt(GEN_HORIZON))
+    up_t = spot * (1 + move_pct)
+    dn_t = spot * (1 - move_pct)
+    odds_up = _clamp(100 * sum(1 for v in hi if v >= up_t) / runs)
+    odds_dn = _clamp(100 * sum(1 for v in lo if v <= dn_t) / runs)
+
+    return {
+        "symbol": sym,
+        "name": meta["name"],
+        "type": meta["type"],
+        "exchange": meta["exchange"],
+        "spot": round(spot, 4),
+        "direction": "up" if prob_up >= 50 else "down",
+        "prob_up": prob_up,
+        "exp_close": round(exp_close, 4),
+        "exp_high": round(exp_high, 4),
+        "exp_low": round(exp_low, 4),
+        "exp_change_pct": round((exp_close / spot - 1) * 100, 2),
+        "move_pct": round(move_pct * 100, 2),
+        "odds_up_move": odds_up,
+        "odds_dn_move": odds_dn,
+        "horizon_days": GEN_HORIZON,
+        "interval": GEN_INTERVAL,
+        "samples": runs,
+        "path": [round(v, 4) for v in _downsample(mean_path, 16)],
+    }
+
+
 def _refresher():
     while True:
         try:
@@ -217,3 +385,25 @@ def forecast():
         return dict(CACHE) | {"interval": INTERVAL, "horizon_short": HORIZON_SHORT,
                               "horizon_long": HORIZON_LONG, "sample_count": SAMPLE_COUNT,
                               "model": MODEL_NAME}
+
+
+@app.get("/forecast/symbol")
+def forecast_symbol(q: str):
+    """On-demand forecast for ANY asset (stocks, ETFs, indices, FX, commodities, crypto).
+    Resolves q -> Yahoo symbol -> daily candles -> Kronos. Per-symbol TTL cache."""
+    if _PREDICTOR is None:
+        return {"ok": False, "status": "warming", "query": q}
+    meta = resolve_symbol(q)
+    if not meta:
+        return {"ok": False, "error": "could not resolve a tradable symbol", "query": q}
+    sym = meta["symbol"]
+    now = time.time()
+    hit = FC_CACHE.get(sym)
+    if hit and now - hit[0] < SYMBOL_TTL:
+        return {"ok": True, "cached": True, "query": q, **hit[1]}
+    res = _forecast_symbol(meta)
+    if not res:
+        return {"ok": False, "error": "no candle data or forecast failed",
+                "query": q, "symbol": sym, "name": meta["name"]}
+    FC_CACHE[sym] = (now, res)
+    return {"ok": True, "cached": False, "query": q, **res}
