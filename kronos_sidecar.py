@@ -402,6 +402,76 @@ def _cg_ohlc(coin_id: str):
         return None
 
 
+# ---- EastMoney (Chinese A-share + HK; also US). Keyless, China-native ----
+EM_SUGGEST = "https://searchapi.eastmoney.com/api/suggest/get"
+EM_KLINE = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+EM_HEADERS = {**BROWSER_UA, "Referer": "https://quote.eastmoney.com/"}
+_EM_MKT = {"0": "SZ", "1": "SH", "105": "NASDAQ", "106": "NYSE", "107": "AMEX",
+           "116": "HK", "100": "INDEX", "90": "BOARD"}
+_EM_TYPE = {"SH": "A_SHARE", "SZ": "A_SHARE", "HK": "HK_EQUITY",
+            "NASDAQ": "EQUITY", "NYSE": "EQUITY", "AMEX": "EQUITY"}
+
+
+def _is_cjk(s: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in s)
+
+
+def _em_resolve(q: str):
+    """Chinese name / pinyin / A-share code / HK code -> EastMoney secid + meta."""
+    try:
+        url = EM_SUGGEST + "?" + urllib.parse.urlencode(
+            {"input": q, "type": "14", "status": "1", "count": "8",
+             "token": "D43BF722C8E33BDC906FB84D85E326E8"})
+        data = json.loads(_http(url, headers=EM_HEADERS).decode())
+        rows = ((data.get("QuotationCodeTable") or {}).get("Data")) or []
+        if not rows:
+            return None
+        # prefer A-share / HK listings over others
+        def rank(r):
+            m = _EM_MKT.get(str(r.get("MktNum") or ""), "")
+            return {"SH": 0, "SZ": 0, "HK": 1}.get(m, 2)
+        rows.sort(key=rank)
+        pick = rows[0]
+        mkt = str(pick.get("MktNum") or "")
+        code = pick.get("Code") or ""
+        if not code or not mkt:
+            return None
+        market = _EM_MKT.get(mkt, mkt)
+        return {"symbol": code, "name": pick.get("Name") or code,
+                "type": _EM_TYPE.get(market, "EQUITY"), "exchange": market,
+                "source": "em", "key": f"{mkt}.{code}"}
+    except Exception as e:
+        print(f"[em-resolve] {q!r} failed: {e}", flush=True)
+        return None
+
+
+def _em_candles(secid: str):
+    """Daily OHLCV from EastMoney. klines field order is date,open,CLOSE,high,low,volume,..."""
+    try:
+        url = EM_KLINE + "?" + urllib.parse.urlencode({
+            "secid": secid, "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+            "klt": "101", "fqt": "1", "beg": "0", "end": "20500101",
+            "lmt": str(LOOKBACK_DAYS), "ut": "fa5fd1943c7b386f172d6893dbfba10b"})
+        data = json.loads(_http(url, headers=EM_HEADERS).decode())
+        klines = ((data.get("data") or {}).get("klines")) or []
+        rows = []
+        for ln in klines:
+            p = ln.split(",")
+            if len(p) < 6:
+                continue
+            try:
+                ep = int(pd.Timestamp(p[0], tz="UTC").timestamp())
+                o, c, h, l, v = float(p[1]), float(p[2]), float(p[3]), float(p[4]), float(p[5])
+            except Exception:
+                continue
+            rows.append((ep, o, h, l, c, v))  # reorder close(2nd) -> o,h,l,c
+        return _df_from_rows(rows)
+    except Exception as e:
+        print(f"[em-candles] {secid} failed: {e}", flush=True)
+        return None
+
+
 # ---- name -> ticker (SEC, free US equities directory) -------------------
 def _sec_index():
     now = time.time()
@@ -478,6 +548,17 @@ def resolve_symbol(q: str):
         return SYM_CACHE[low]
 
     meta = None
+    # 0) Chinese markets first: CJK name/pinyin handled later; codes & suffixes here
+    if _is_cjk(q) or re.match(r"^\d{6}$", q) or low.endswith((".hk", ".ss", ".sz")):
+        cq = q
+        for suf in (".hk", ".ss", ".sz"):
+            if low.endswith(suf):
+                cq = q[:-3]
+                break
+        meta = _em_resolve(cq)
+        if meta:
+            SYM_CACHE[low] = meta
+            return meta
     # 1) crypto by alias
     if low in CRYPTO_ALIASES:
         coin = CRYPTO_ALIASES[low]
@@ -524,19 +605,21 @@ def resolve_symbol(q: str):
                                 "type": "CRYPTOCURRENCY", "source": "hl" if on_hl else "cg",
                                 "key": cg["symbol"] if on_hl else cg["id"]}
         else:
-            # 7) free-text name -> SEC (US equity), else CoinGecko (maybe a coin/project)
+            # 7) free-text name -> SEC (US equity), else EastMoney (pinyin/CN), else CoinGecko
             hit = _sec_ticker(q)
             if hit:
                 meta = {"symbol": hit[0], "name": hit[1], "type": "EQUITY",
                         "source": "stooq", "key": f"{hit[0].lower()}.us"}
             else:
-                cg = _cg_search(q)
-                if cg:
-                    coin = cg["symbol"]
-                    on_hl = coin in set(CRYPTO_ALIASES.values()) or coin in CRYPTO_ALIASES.values()
-                    meta = {"symbol": coin or cg["id"].upper(), "name": cg["name"],
-                            "type": "CRYPTOCURRENCY", "source": "hl" if on_hl else "cg",
-                            "key": coin if on_hl else cg["id"]}
+                meta = _em_resolve(q)  # catches pinyin like "maotai"/"tencent" -> CN/HK listing
+                if not meta:
+                    cg = _cg_search(q)
+                    if cg:
+                        coin = cg["symbol"]
+                        on_hl = coin in set(CRYPTO_ALIASES.values())
+                        meta = {"symbol": coin or cg["id"].upper(), "name": cg["name"],
+                                "type": "CRYPTOCURRENCY", "source": "hl" if on_hl else "cg",
+                                "key": coin if on_hl else cg["id"]}
     if meta:
         SYM_CACHE[low] = meta
     return meta
@@ -546,6 +629,8 @@ def _candles(meta: dict):
     """Dispatch to the right source. Never mutates meta (it may be the cached object)."""
     src = meta.get("source")
     key = meta.get("key")
+    if src == "em":
+        return _em_candles(key)
     if src in ("stooq", "fmp"):
         df = _fmp_candles(meta)        # API source (no IP block) when FMP_API_KEY set
         if df is not None:
@@ -718,6 +803,13 @@ def src_debug(q: str = "AAPL"):
         out["sec_items"] = len(_sec_index() or [])
     except Exception as e:
         out["sec_err"] = str(e)[:200]
+    # EastMoney (Chinese markets) probes
+    probe("em_600519_moutai", lambda: _em_candles("1.600519"))
+    probe("em_00700_tencent", lambda: _em_candles("116.00700"))
+    try:
+        out["em_resolve_cjk"] = _em_resolve("贵州茅台")
+    except Exception as e:
+        out["em_resolve_err"] = str(e)[:200]
     # raw stooq body (why is it failing from this IP?)
     try:
         rawb = _http(STOOQ + "?" + urllib.parse.urlencode({"s": "aapl.us", "i": "d"}),
