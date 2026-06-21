@@ -445,8 +445,54 @@ def _em_resolve(q: str):
         return None
 
 
+TX_KLINE = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+
+
+def _tx_symbol(secid: str):
+    """EastMoney secid (mkt.code) -> Tencent symbol (sh/sz/hk + code)."""
+    try:
+        mkt, code = secid.split(".")
+    except ValueError:
+        return None
+    pre = {"1": "sh", "0": "sz", "116": "hk"}.get(mkt)
+    return f"{pre}{code}" if pre else None
+
+
+def _tencent_candles(secid: str):
+    """Daily OHLCV from Tencent (gtimg). Reliable where EastMoney push2his blocks
+    datacenter IPs. kline row order is [date, open, CLOSE, high, low, volume] — same
+    as EastMoney, so the parse matches."""
+    sym = _tx_symbol(secid)
+    if not sym:
+        return None
+    try:
+        url = TX_KLINE + "?" + urllib.parse.urlencode(
+            {"param": f"{sym},day,,,{LOOKBACK_DAYS},qfq"})
+        data = json.loads(_http(url, headers=EM_HEADERS).decode())
+        node = ((data.get("data") or {}).get(sym)) or {}
+        klines = node.get("qfqday") or node.get("day") or []
+        rows = []
+        for p in klines:
+            if len(p) < 6:
+                continue
+            try:
+                ep = int(pd.Timestamp(p[0], tz="UTC").timestamp())
+                o, c, h, l, v = float(p[1]), float(p[2]), float(p[3]), float(p[4]), float(p[5])
+            except Exception:
+                continue
+            rows.append((ep, o, h, l, c, v))  # close(2nd) -> o,h,l,c
+        return _df_from_rows(rows)
+    except Exception as e:
+        print(f"[tx-candles] {secid} failed: {e}", flush=True)
+        return None
+
+
 def _em_candles(secid: str):
-    """Daily OHLCV from EastMoney. klines field order is date,open,CLOSE,high,low,volume,..."""
+    """Daily OHLCV for China names. Tencent is primary (reliable from datacenter IPs);
+    EastMoney push2his is the fallback (it blocks/throttles cloud IPs)."""
+    df = _tencent_candles(secid)
+    if df is not None and len(df) >= 64:
+        return df
     try:
         url = EM_KLINE + "?" + urllib.parse.urlencode({
             "secid": secid, "fields1": "f1,f2,f3,f4,f5,f6",
@@ -682,6 +728,50 @@ def _ccy_symbol(meta):
     return "$"
 
 
+def _dimension_scores(hist, spot, prob_up, daily_vol, bands):
+    """Honest, deterministic scores from price + forecast only. 0-100 each.
+    Direction = directional conviction (capped — 20 samples can't justify 100).
+    Momentum  = recent trend (spot vs 20d MA + 10d return), 50 = neutral.
+    Risk      = realized vol + forecast-cone width (HIGH = more risk, not 'good')."""
+    closes = hist["close"]
+    direction = int(min(95, round(abs(prob_up - 50) * 2)))
+    ma20 = float(closes.tail(20).mean()) or spot
+    ret10 = (spot / float(closes.iloc[-11]) - 1) if len(closes) > 11 else 0.0
+    ma_dev = (spot / ma20 - 1) if ma20 else 0.0
+    mom_raw = 50 + 0.5 * (ma_dev / 0.08) * 50 + 0.5 * (ret10 / 0.10) * 50
+    momentum = int(max(2, min(98, round(mom_raw))))
+    cone_w = 0.0
+    try:
+        cone_w = (bands["p90"][-1] - bands["p10"][-1]) / spot if spot else 0.0
+    except Exception:
+        pass
+    risk = int(max(5, min(95, round(0.6 * (daily_vol / 0.05) * 100 +
+                                     0.4 * (cone_w / 0.20) * 100))))
+    return {"direction": direction, "momentum": momentum, "risk": risk}
+
+
+def _signal(prob_up):
+    """Tiered directional signal from conviction — not a binary flip at 50%."""
+    if prob_up >= 72:
+        return "Strong Buy"
+    if prob_up >= 58:
+        return "Buy"
+    if prob_up > 42:
+        return "Neutral"
+    if prob_up > 28:
+        return "Sell"
+    return "Strong Sell"
+
+
+def _prob_capped(p):
+    """Display-honest probability: 20 samples can't resolve 99% vs 95%."""
+    if p >= 90:
+        return "90%+"
+    if p <= 10:
+        return "<10%"
+    return f"{int(round(p / 5.0) * 5)}%"
+
+
 def _forecast_symbol(meta: dict):
     """Run Kronos GEN_SAMPLES times over daily candles for one resolved symbol."""
     sym = meta["symbol"]
@@ -751,6 +841,9 @@ def _forecast_symbol(meta: dict):
     odds_up = _clamp(100 * sum(1 for v in hi if v >= up_t) / runs)
     odds_dn = _clamp(100 * sum(1 for v in lo if v <= dn_t) / runs)
 
+    scores = _dimension_scores(hist, spot, prob_up, daily_vol, bands)
+    large_move = abs(exp_close / spot - 1) > 1.5 * move_pct
+
     return {
         "symbol": sym,
         "name": meta["name"],
@@ -760,6 +853,10 @@ def _forecast_symbol(meta: dict):
         "spot": round(spot, 4),
         "direction": "up" if prob_up >= 50 else "down",
         "prob_up": prob_up,
+        "prob_up_display": _prob_capped(prob_up),
+        "signal": _signal(prob_up),
+        "scores": scores,
+        "large_move": large_move,
         "exp_close": round(exp_close, 4),
         "exp_high": round(exp_high, 4),
         "exp_low": round(exp_low, 4),
