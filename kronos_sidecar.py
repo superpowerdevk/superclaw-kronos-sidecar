@@ -841,6 +841,7 @@ def _forecast_symbol(meta: dict):
     odds_up = _clamp(100 * sum(1 for v in hi if v >= up_t) / runs)
     odds_dn = _clamp(100 * sum(1 for v in lo if v <= dn_t) / runs)
 
+    bands = _bands_from_paths(paths, GEN_HORIZON)
     scores = _dimension_scores(hist, spot, prob_up, daily_vol, bands)
     large_move = abs(exp_close / spot - 1) > 1.5 * move_pct
 
@@ -876,7 +877,7 @@ def _forecast_symbol(meta: dict):
         "hist_l": [round(float(v), 4) for v in hist["low"].tail(90)],
         "hist_c": [round(float(v), 4) for v in hist["close"].tail(90)],
         "fc_t": [int(t.timestamp()) for t in yts],
-        "bands": _bands_from_paths(paths, GEN_HORIZON),
+        "bands": bands,
     }
 
 
